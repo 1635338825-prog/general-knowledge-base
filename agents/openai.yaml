@@ -1,0 +1,4 @@
+interface:
+  display_name: "General Knowledge Base"
+  short_description: "Use MinerU VLM plus LLM digestion to parse multi-source materials, write digest.json, rebuild Obsidian-style knowledge pages, and query the resulting personal knowledge vault."
+  default_prompt: "Use $general-knowledge-base to initialize an Obsidian-style personal knowledge vault, parse files with MinerU VLM, split large PDFs when needed, generate digest.json with an LLM, render source/topic/entity pages, rebuild from existing digests, and audit or query the resulting vault."
