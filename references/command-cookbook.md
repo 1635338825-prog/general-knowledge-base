@@ -16,6 +16,24 @@ Ingest one file and prepare a Codex source bundle:
 python .\scripts\wiki_task.py ingest-file --file "C:\path\document.pdf" --vault D:\MyWiki --tag 资料
 ```
 
+Ingest one file with Unlimited-OCR as the parsing backend:
+
+```powershell
+python .\scripts\wiki_task.py ingest-file --file "C:\path\document.pdf" --vault D:\MyWiki --tag 资料 --ocr-engine unlimited-ocr --unlimited-ocr-project "C:\path\Unlimited-OCR"
+```
+
+Ingest a folder of PDFs:
+
+```powershell
+python .\scripts\wiki_task.py ingest-folder --folder "C:\path\docs" --vault D:\MyWiki --pattern "*.pdf" --tag 资料
+```
+
+Ingest a folder with Unlimited-OCR:
+
+```powershell
+python .\scripts\wiki_task.py ingest-folder --folder "C:\path\docs" --vault D:\MyWiki --pattern "*.pdf" --tag 资料 --ocr-engine unlimited-ocr --unlimited-ocr-project "C:\path\Unlimited-OCR"
+```
+
 Prepare a parsed source for Codex digestion:
 
 ```powershell
@@ -88,6 +106,31 @@ Audit:
 python .\scripts\wiki_task.py audit-vault --vault D:\MyWiki
 ```
 
+Search Sciverse:
+
+```powershell
+$env:SCIVERSE_API_TOKEN = "<token>"
+python .\scripts\wiki_task.py sciverse-search --vault D:\MyWiki --query "graphene battery cycle stability" --page-size 5
+```
+
+Import selected Sciverse results as candidate sources:
+
+```powershell
+python .\scripts\wiki_task.py sciverse-import --vault D:\MyWiki --search-results "D:\MyWiki\logs\sciverse-search\<results>.results.json" --indexes 1,2 --purpose-role direct-evidence
+```
+
+Resolve DOI landing pages and store access URLs:
+
+```powershell
+python .\scripts\wiki_task.py sciverse-fetch --vault D:\MyWiki --source-id <source-id>
+```
+
+Download a candidate PDF and ingest it immediately:
+
+```powershell
+python .\scripts\wiki_task.py sciverse-download --vault D:\MyWiki --source-id <source-id>
+```
+
 ## Codex Digest Loops
 
 ### Source
@@ -97,6 +140,8 @@ python .\scripts\wiki_task.py audit-vault --vault D:\MyWiki
 3. let Codex read the adjacent bundle and output pure JSON
 4. save that JSON
 5. `apply-digest`
+
+When `--ocr-engine unlimited-ocr` is used, the OCR backend only replaces the parsing stage. The downstream bundle, digest, topic/entity, and retrieval workflow stays unchanged because the script normalizes output into the same `content.json` and `content.md` contract.
 
 The output should be a real digestion of the whole source, not a short summary. The four required body sections are:
 

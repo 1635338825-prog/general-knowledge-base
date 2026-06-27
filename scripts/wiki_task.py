@@ -3,14 +3,19 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import html
 import json
 import os
 import re
+import ssl
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib import error, request
+from urllib.parse import urljoin
 
 
 SOURCE_SECTIONS = [
@@ -158,6 +163,13 @@ def load_cache(vault: Path) -> dict[str, Any]:
     if not isinstance(cache.get("entity_pages"), dict):
         cache["entity_pages"] = {}
     return cache
+
+
+def load_sciverse_token() -> str:
+    token = clean_text(os.getenv("SCIVERSE_API_TOKEN"))
+    if not token:
+        raise ValueError("Missing SCIVERSE_API_TOKEN environment variable")
+    return token
 
 
 def save_cache(vault: Path, cache: dict[str, Any]) -> None:
@@ -328,6 +340,435 @@ def normalize_term_key(value: str) -> str:
     return clean_text(value).casefold()
 
 
+def normalize_doi(value: str) -> str:
+    text = clean_text(value).lower()
+    text = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", text)
+    return text.strip()
+
+
+def sciverse_source_id(result: dict[str, Any]) -> str:
+    doi = normalize_doi(str(result.get("doi") or ""))
+    if doi:
+        seed = f"doi:{doi}"
+    else:
+        doc_id = clean_text(result.get("doc_id"))
+        if doc_id:
+            seed = f"doc:{doc_id}"
+        else:
+            title = clean_text(result.get("title"))
+            year = clean_text(result.get("publication_published_year"))
+            seed = f"title:{title}|year:{year}"
+    return f"scv_{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:12]}"
+
+
+def sciverse_result_identity(result: dict[str, Any]) -> tuple[str, str]:
+    doi = normalize_doi(str(result.get("doi") or ""))
+    if doi:
+        return ("doi", doi)
+    doc_id = clean_text(result.get("doc_id"))
+    if doc_id:
+        return ("doc_id", doc_id)
+    title = normalize_term_key(str(result.get("title") or ""))
+    year = clean_text(result.get("publication_published_year"))
+    return ("title_year", f"{title}|{year}")
+
+
+def sciverse_result_matches(source: dict[str, Any], result: dict[str, Any]) -> bool:
+    key_type, key_value = sciverse_result_identity(result)
+    if key_type == "doi":
+        return normalize_doi(str(source.get("doi") or "")) == key_value
+    if key_type == "doc_id":
+        return clean_text(source.get("sciverse_doc_id")) == key_value
+    source_title = normalize_term_key(str(source.get("title") or ""))
+    source_year = clean_text(source.get("publication_published_year"))
+    return f"{source_title}|{source_year}" == key_value
+
+
+def sciverse_metadata_path(vault: Path, source_id: str) -> Path:
+    path = vault / "derived" / source_id / "sciverse.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def sciverse_search_dir(vault: Path) -> Path:
+    path = vault / "logs" / "sciverse-search"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def parse_sciverse_filter_json(value: str) -> list[dict[str, Any]]:
+    if not clean_text(value):
+        return []
+    payload = json.loads(value)
+    if not isinstance(payload, list):
+        raise ValueError("--filter-json must decode to a list")
+    normalized: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise ValueError("Each filter must be a JSON object")
+        normalized.append(item)
+    return normalized
+
+
+def sciverse_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def sciverse_post_meta_search(payload: dict[str, Any], token: str) -> dict[str, Any]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = request.Request(
+        "https://api.sciverse.space/meta-search",
+        data=data,
+        headers=sciverse_headers(token),
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=60) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            return json.loads(body)
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        message = body
+        try:
+            parsed = json.loads(body)
+            message = json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            pass
+        raise RuntimeError(f"Sciverse HTTP {exc.code}: {message}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"Sciverse request failed: {exc.reason}") from exc
+
+
+def normalize_sciverse_result(item: dict[str, Any], rank: int) -> dict[str, Any]:
+    year_value = item.get("publication_published_year")
+    if isinstance(year_value, float) and year_value.is_integer():
+        year_value = int(year_value)
+    return {
+        "rank": rank,
+        "title": clean_text(item.get("title")),
+        "doi": normalize_doi(str(item.get("doi") or "")),
+        "publication_published_year": year_value,
+        "publication_venue_name_unified": clean_text(item.get("publication_venue_name_unified")),
+        "relevance_score": item.get("relevance_score"),
+        "doc_id": clean_text(item.get("doc_id")),
+    }
+
+
+def build_sciverse_source_record(
+    vault: Path,
+    result: dict[str, Any],
+    query: str,
+    tags: list[str],
+    purpose_role: str,
+) -> tuple[str, dict[str, Any], dict[str, Any], Path]:
+    source_id = sciverse_source_id(result)
+    metadata_path = sciverse_metadata_path(vault, source_id)
+    metadata = {
+        "source_id": source_id,
+        "discovery_source": "sciverse",
+        "imported_at": utc_now(),
+        "query": query,
+        "raw_result": result,
+    }
+    record = {
+        "source_id": source_id,
+        "title": clean_text(result.get("title")) or source_id,
+        "status": "discovered_only",
+        "parse_status": "discovered_only",
+        "structured_status": "discovered_only",
+        "source_type": "paper",
+        "discovery_source": "sciverse",
+        "doi": normalize_doi(str(result.get("doi") or "")),
+        "sciverse_doc_id": clean_text(result.get("doc_id")),
+        "publication_published_year": result.get("publication_published_year"),
+        "publication_venue_name_unified": clean_text(result.get("publication_venue_name_unified")),
+        "relevance_score": result.get("relevance_score"),
+        "sciverse_query": query,
+        "sciverse_imported_at": metadata["imported_at"],
+        "source_discovery_metadata_path": vault_relative(metadata_path, vault),
+        "tags": merge_unique_lists(tags),
+    }
+    if purpose_role:
+        record["role_for_purpose"] = purpose_role
+    return source_id, record, metadata, metadata_path
+
+
+def find_existing_sciverse_source(cache: dict[str, Any], result: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    for source_id, source in cache.get("sources", {}).items():
+        if not isinstance(source, dict):
+            continue
+        if sciverse_result_matches(source, result):
+            return source_id, source
+    return None
+
+
+def parse_indexes(value: str) -> list[int]:
+    indexes: list[int] = []
+    seen: set[int] = set()
+    for chunk in value.split(","):
+        text = clean_text(chunk)
+        if not text:
+            continue
+        number = int(text)
+        if number <= 0:
+            raise ValueError("--indexes must contain positive integers")
+        if number in seen:
+            continue
+        seen.add(number)
+        indexes.append(number)
+    if not indexes:
+        raise ValueError("--indexes must contain at least one index")
+    return indexes
+
+
+def source_ids_from_args(cache: dict[str, Any], source_id: str, all_sources: bool) -> list[str]:
+    if all_sources:
+        selected = [
+            sid
+            for sid, item in sorted(cache.get("sources", {}).items())
+            if isinstance(item, dict) and clean_text(item.get("discovery_source")) == "sciverse"
+        ]
+        if not selected:
+            raise ValueError("No Sciverse-imported sources found in cache")
+        return selected
+    selected_id = clean_text(source_id)
+    if not selected_id:
+        raise ValueError("Provide --source-id or use --all")
+    if selected_id not in cache.get("sources", {}):
+        raise ValueError(f"source_id not found: {selected_id}")
+    return [selected_id]
+
+
+def fetch_url_text(url: str, accept: str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8") -> tuple[str, str, str]:
+    req = request.Request(
+        url,
+        headers={
+            "User-Agent": "general-knowledge-base/1.0 (+Sciverse fetch)",
+            "Accept": accept,
+        },
+        method="GET",
+    )
+    verification_mode = "verified"
+    try:
+        response = request.urlopen(req, timeout=60)
+    except error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            response = request.urlopen(req, timeout=60, context=ssl._create_unverified_context())
+            verification_mode = "unverified_ssl"
+        else:
+            raise
+    with response:
+        final_url = response.geturl()
+        content_type = response.headers.get("Content-Type", "")
+        body = response.read()
+    charset_match = re.search(r"charset=([^\s;]+)", content_type, flags=re.I)
+    encoding = charset_match.group(1).strip("\"'") if charset_match else "utf-8"
+    text = body.decode(encoding, errors="replace")
+    return final_url, f"{content_type} | verification={verification_mode}", text
+
+
+def doi_landing_url(doi: str) -> str:
+    return f"https://doi.org/{normalize_doi(doi)}"
+
+
+def extract_pdf_candidate_url(base_url: str, html_text: str) -> str:
+    meta_patterns = [
+        r'<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+property=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
+    ]
+    for pattern in meta_patterns:
+        match = re.search(pattern, html_text, flags=re.I)
+        if match:
+            return urljoin(base_url, html.unescape(match.group(1)))
+
+    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html_text, flags=re.I)
+    for href in hrefs:
+        joined = urljoin(base_url, html.unescape(href))
+        lowered = joined.lower()
+        if ".pdf" in lowered or "/pdf" in lowered or "downloadpdf" in lowered or "pdfdirect" in lowered:
+            return joined
+    return ""
+
+
+def fetch_sciverse_access_info(source: dict[str, Any]) -> dict[str, Any]:
+    doi = normalize_doi(str(source.get("doi") or ""))
+    if not doi:
+        raise ValueError("Source has no DOI; cannot resolve DOI page")
+    doi_url = doi_landing_url(doi)
+    resolved_url, content_type, body = fetch_url_text(doi_url)
+    pdf_candidate_url = ""
+    if "pdf" in content_type.lower():
+        pdf_candidate_url = resolved_url
+    elif "html" in content_type.lower() or "xml" in content_type.lower():
+        pdf_candidate_url = extract_pdf_candidate_url(resolved_url, body)
+    return {
+        "doi_url": doi_url,
+        "resolved_url": resolved_url,
+        "content_type": content_type,
+        "pdf_candidate_url": pdf_candidate_url,
+        "fetched_at": utc_now(),
+    }
+
+
+def looks_like_pdf(content_type: str, body: bytes, url: str) -> bool:
+    lowered_type = content_type.lower()
+    sample = body[:512].lstrip().lower()
+    if sample.startswith(b"<html") or sample.startswith(b"<!doctype html") or sample.startswith(b"<?xml"):
+        return False
+    if body.startswith(b"%PDF"):
+        return True
+    return "application/pdf" in lowered_type
+
+
+def fetch_url_bytes(url: str, accept: str = "application/pdf,text/html,application/xhtml+xml;q=0.9,*/*;q=0.8") -> tuple[str, str, bytes]:
+    req = request.Request(
+        url,
+        headers={
+            "User-Agent": "general-knowledge-base/1.0 (+Sciverse download)",
+            "Accept": accept,
+        },
+        method="GET",
+    )
+    verification_mode = "verified"
+    try:
+        response = request.urlopen(req, timeout=120)
+    except error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            response = request.urlopen(req, timeout=120, context=ssl._create_unverified_context())
+            verification_mode = "unverified_ssl"
+        else:
+            raise
+    with response:
+        final_url = response.geturl()
+        content_type = response.headers.get("Content-Type", "")
+        body = response.read()
+    return final_url, f"{content_type} | verification={verification_mode}", body
+
+
+def derive_pdf_candidate_urls(source: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for key in ["pdf_candidate_url", "resolved_url", "doi_url"]:
+        value = clean_text(source.get(key))
+        if value:
+            urls.append(value)
+    resolved_url = clean_text(source.get("resolved_url"))
+    if resolved_url:
+        if ".full" in resolved_url:
+            urls.append(resolved_url.replace(".full", ".pdf"))
+        if resolved_url.endswith("/full"):
+            urls.append(resolved_url[:-5] + "/pdf")
+        if "/full?" in resolved_url:
+            urls.append(resolved_url.replace("/full?", "/pdf?"))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        lowered = url.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(url)
+    return deduped
+
+
+def sciverse_download_dir(vault: Path) -> Path:
+    path = vault / "raw" / "sciverse"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def download_sciverse_pdf(source: dict[str, Any], vault: Path) -> tuple[Path, dict[str, Any]]:
+    candidates = derive_pdf_candidate_urls(source)
+    if not candidates:
+        raise ValueError("No DOI-derived or candidate URL available for PDF download")
+    last_error = "No PDF candidate worked"
+    for candidate in candidates:
+        try:
+            final_url, content_type, body = fetch_url_bytes(candidate)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        if not looks_like_pdf(content_type, body, final_url):
+            last_error = f"Not a PDF response from {candidate}"
+            continue
+        source_id = clean_text(source.get("source_id")) or "sciverse"
+        output_path = sciverse_download_dir(vault) / f"{source_id}.pdf"
+        output_path.write_bytes(body)
+        info = {
+            "download_url": candidate,
+            "final_url": final_url,
+            "content_type": content_type,
+            "downloaded_at": utc_now(),
+            "saved_path": str(output_path),
+            "size_bytes": len(body),
+        }
+        return output_path, info
+    raise ValueError(last_error)
+
+
+def run_self_command(args: list[str]) -> dict[str, Any]:
+    completed = subprocess.run(
+        [sys.executable, __file__, *args],
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    stdout = completed.stdout.strip()
+    if completed.returncode != 0:
+        raise RuntimeError(stdout or completed.stderr.strip() or f"Subcommand failed: {' '.join(args)}")
+    try:
+        return json.loads(stdout)
+    except Exception as exc:
+        raise RuntimeError(f"Could not parse subcommand JSON output: {exc}") from exc
+
+
+def merge_sciverse_candidate_into_ingested_source(vault: Path, old_source_id: str, new_source_id: str, download_info: dict[str, Any]) -> None:
+    if old_source_id == new_source_id:
+        return
+    cache = load_cache(vault)
+    old_source = cache.get("sources", {}).get(old_source_id)
+    new_source = cache.get("sources", {}).get(new_source_id)
+    if not isinstance(old_source, dict) or not isinstance(new_source, dict):
+        return
+    old_metadata_path = sciverse_metadata_path(vault, old_source_id)
+    new_metadata_path = sciverse_metadata_path(vault, new_source_id)
+    metadata = load_json(old_metadata_path, {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata["source_id"] = new_source_id
+    metadata["download"] = download_info
+    dump_json(new_metadata_path, metadata)
+    for key in [
+        "discovery_source",
+        "doi",
+        "sciverse_doc_id",
+        "publication_published_year",
+        "publication_venue_name_unified",
+        "relevance_score",
+        "sciverse_query",
+        "sciverse_imported_at",
+        "role_for_purpose",
+        "doi_url",
+        "resolved_url",
+        "pdf_candidate_url",
+    ]:
+        value = old_source.get(key)
+        if value not in (None, "", []):
+            new_source[key] = value
+    new_source["source_discovery_metadata_path"] = vault_relative(new_metadata_path, vault)
+    new_source["downloaded_pdf_path"] = vault_relative(Path(download_info["saved_path"]), vault)
+    new_source["tags"] = merge_unique_lists(new_source.get("tags"), old_source.get("tags"), ["sciverse", "downloaded"])
+    cache["sources"][new_source_id] = new_source
+    del cache["sources"][old_source_id]
+    save_cache(vault, cache)
+
+
 def is_managed_page(path: Path) -> bool:
     if not path.exists():
         return False
@@ -462,6 +903,140 @@ def ingest_env(structure: bool, mineru_timeout: int | None, digest_engine: str) 
     if mineru_timeout:
         updates["MINERU_TIMEOUT_SECONDS"] = str(mineru_timeout)
     return updates or None
+
+
+def unlimited_ocr_project_path(value: str | None) -> Path:
+    if value:
+        return Path(value).resolve()
+    env_value = os.getenv("UNLIMITED_OCR_PROJECT")
+    if env_value:
+        return Path(env_value).resolve()
+    raise ValueError("Unlimited-OCR project path is required. Pass --unlimited-ocr-project or set UNLIMITED_OCR_PROJECT.")
+
+
+def run_unlimited_ocr(project: Path, source_file: Path, output_dir: Path, concurrency: int | None = None) -> subprocess.CompletedProcess[str]:
+    infer_path = project / "infer.py"
+    if not infer_path.exists():
+        raise FileNotFoundError(f"Unlimited-OCR infer.py not found: {infer_path}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(infer_path), "--output_dir", str(output_dir)]
+    suffix = source_file.suffix.lower()
+    if suffix == ".pdf":
+        command.extend(["--pdf", str(source_file)])
+    elif suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}:
+        image_dir = output_dir / "_single_image_input"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        staged = image_dir / source_file.name
+        shutil.copy2(source_file, staged)
+        command.extend(["--image_dir", str(image_dir)])
+    else:
+        raise ValueError(f"Unlimited-OCR currently supports PDF or image files only, got: {source_file.suffix}")
+    if concurrency and concurrency > 0:
+        command.extend(["--concurrency", str(concurrency)])
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return subprocess.run(
+        command,
+        cwd=str(project),
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+
+
+def collect_unlimited_ocr_pages(output_dir: Path) -> list[tuple[str, str]]:
+    md_paths = sorted(path for path in output_dir.rglob("*.md") if path.is_file())
+    if md_paths:
+        return [(path.stem, read_text(path)) for path in md_paths if clean_text(read_text(path))]
+
+    txt_paths = sorted(path for path in output_dir.rglob("*.txt") if path.is_file())
+    if txt_paths:
+        return [(path.stem, read_text(path)) for path in txt_paths if clean_text(read_text(path))]
+
+    json_paths = sorted(path for path in output_dir.rglob("*.json") if path.is_file())
+    pages: list[tuple[str, str]] = []
+    for path in json_paths:
+        payload = load_json(path, {})
+        if isinstance(payload, dict):
+            for key in ["text", "markdown", "content"]:
+                value = payload.get(key)
+                text = clean_text(value)
+                if text:
+                    pages.append((path.stem, str(value)))
+                    break
+    return pages
+
+
+def write_unlimited_ocr_outputs(vault: Path, source_file: Path, source_id: str, title: str, tags: list[str], output_dir: Path, cache: dict[str, Any]) -> dict[str, Any]:
+    pages = collect_unlimited_ocr_pages(output_dir)
+    if not pages:
+        raise ValueError(f"Unlimited-OCR produced no readable markdown/text output under {output_dir}")
+
+    raw_dir = vault / "raw" / source_id
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / source_file.name
+    shutil.copy2(source_file, raw_path)
+
+    derived_dir = vault / "derived" / source_id
+    derived_dir.mkdir(parents=True, exist_ok=True)
+    content_md = derived_dir / "content.md"
+    content_json = derived_dir / "content.json"
+
+    markdown_chunks = []
+    blocks = []
+    for index, (anchor, text) in enumerate(pages, start=1):
+        cleaned = str(text).strip()
+        heading = f"## Page {index:03d}"
+        markdown_chunks.extend([heading, "", cleaned, ""])
+        blocks.append(
+            {
+                "id": f"b{index}",
+                "anchor": anchor or f"page-{index}",
+                "page": index,
+                "text": cleaned,
+            }
+        )
+    write_text(content_md, "\n".join(markdown_chunks).strip() + "\n")
+    dump_json(
+        content_json,
+        {
+            "engine": "unlimited-ocr",
+            "source_file": source_file.name,
+            "blocks": blocks,
+        },
+    )
+
+    source = ensure_source_record(vault, source_id, cache)
+    source.update(
+        {
+            "source_id": source_id,
+            "title": title,
+            "source_type": source_file.suffix.lower().lstrip("."),
+            "ingested_at": utc_now(),
+            "original_path": str(source_file),
+            "raw_path": vault_relative(raw_path, vault),
+            "derived_markdown_path": vault_relative(content_md, vault),
+            "derived_json_path": vault_relative(content_json, vault),
+            "tags": tags,
+            "ocr_engine": "unlimited-ocr",
+            "status": "parsed_only",
+            "parse_status": "parsed_only",
+            "structured_status": "pending",
+        }
+    )
+    save_cache(vault, cache)
+    return {
+        "source_id": source_id,
+        "status": "parsed_only",
+        "mode": "unlimited-ocr",
+        "content_markdown_path": str(content_md),
+        "content_json_path": str(content_json),
+        "raw_path": str(raw_path),
+    }
 
 
 def normalize_source_digest(payload: dict[str, Any], source_id: str | None = None, strict: bool = False) -> dict[str, Any]:
@@ -1250,14 +1825,20 @@ def command_ingest_file(args: argparse.Namespace) -> None:
     report = base_report("ingest-file", vars(args))
     project = project_path(args.project)
     source_file = Path(args.file).resolve()
+    if args.ocr_engine == "unlimited-ocr" and args.digest_engine != "codex":
+        report["status"] = "failed"
+        report["errors"].append({"stage": "ingest", "error": "Unlimited-OCR currently supports only the codex digest workflow."})
+        finish(report, vault)
+        return
     split_dir = vault / "logs" / "skill-runs" / f"{report['run_id']}-pdf-parts"
     parts = split_pdf(source_file, split_dir, args.split_pages) if source_file.suffix.lower() == ".pdf" else [source_file]
     report["environment"] = {
         "project": str(project),
         "vault": str(vault),
-        "pdf_parser": "MinerU VLM",
+        "pdf_parser": "MinerU VLM" if args.ocr_engine == "mineru" else "Unlimited-OCR",
         "split_pages": args.split_pages,
         "digest_engine": args.digest_engine,
+        "ocr_engine": args.ocr_engine,
     }
 
     results: list[dict[str, Any]] = []
@@ -1266,33 +1847,61 @@ def command_ingest_file(args: argparse.Namespace) -> None:
         title = args.title
         if len(parts) > 1:
             title = f"{source_file.stem} part {index:03d}"
-        cli_args = ["ingest", str(part), "--vault", str(vault)]
-        if title:
-            cli_args.extend(["--title", title])
-        for tag in args.tag:
-            cli_args.extend(["--tag", tag])
-        completed = run_cli(project, cli_args, env=ingest_env(effective_structure, args.mineru_timeout, args.digest_engine))
-        parsed = parse_key_value_stdout(completed.stdout)
-        item = {"file": str(source_file), "part_file": str(part), "returncode": completed.returncode, **parsed}
-        if completed.returncode != 0:
-            item["status"] = "failed"
-            report["errors"].append({"stage": "ingest", "file": str(part), "stderr": completed.stderr[-3000:]})
-            report["status"] = "partial"
-        else:
-            source_id = parsed.get("source_id")
-            item["status"] = parsed.get("status", "unknown")
-            if source_id:
-                report["updated_files"].append(str(vault / "derived" / source_id / "content.json"))
-            if parsed.get("page"):
-                report["generated_files"].append(parsed["page"])
-                report["next_paths"].append(parsed["page"])
-            if source_id and item["status"] == "parsed_only" and args.digest_engine == "codex":
-                try:
-                    maybe_prepare_digest_bundle(vault, source_id, report)
-                    item["bundle"] = str(vault / "logs" / "codex-digest-bundles" / f"{source_id}.json")
-                except Exception as exc:
-                    report["errors"].append({"stage": "prepare-source", "source_id": source_id, "error": str(exc)})
+        if args.ocr_engine == "unlimited-ocr":
+            try:
+                ocr_project = unlimited_ocr_project_path(args.unlimited_ocr_project)
+                ocr_output_dir = vault / "logs" / "skill-runs" / f"{report['run_id']}-unlimited-ocr" / part.stem
+                completed = run_unlimited_ocr(ocr_project, part, ocr_output_dir, args.unlimited_ocr_concurrency)
+                item = {"file": str(source_file), "part_file": str(part), "returncode": completed.returncode}
+                if completed.returncode != 0:
+                    item["status"] = "failed"
+                    report["errors"].append({"stage": "ocr", "file": str(part), "stderr": completed.stderr[-3000:], "stdout": completed.stdout[-2000:]})
                     report["status"] = "partial"
+                else:
+                    cache = load_cache(vault)
+                    source_id = sha1_file(part)
+                    parsed = write_unlimited_ocr_outputs(vault, part, source_id, title or part.stem, list(args.tag), ocr_output_dir, cache)
+                    item.update(parsed)
+                    report["updated_files"].extend([parsed["content_json_path"], parsed["content_markdown_path"], str(vault / ".wiki-cache.json")])
+                    if parsed["status"] == "parsed_only" and args.digest_engine == "codex":
+                        try:
+                            maybe_prepare_digest_bundle(vault, source_id, report)
+                            item["bundle"] = str(vault / "logs" / "codex-digest-bundles" / f"{source_id}.json")
+                        except Exception as exc:
+                            report["errors"].append({"stage": "prepare-source", "source_id": source_id, "error": str(exc)})
+                            report["status"] = "partial"
+            except Exception as exc:
+                item = {"file": str(source_file), "part_file": str(part), "status": "failed"}
+                report["errors"].append({"stage": "ocr", "file": str(part), "error": str(exc)})
+                report["status"] = "partial"
+        else:
+            cli_args = ["ingest", str(part), "--vault", str(vault)]
+            if title:
+                cli_args.extend(["--title", title])
+            for tag in args.tag:
+                cli_args.extend(["--tag", tag])
+            completed = run_cli(project, cli_args, env=ingest_env(effective_structure, args.mineru_timeout, args.digest_engine))
+            parsed = parse_key_value_stdout(completed.stdout)
+            item = {"file": str(source_file), "part_file": str(part), "returncode": completed.returncode, **parsed}
+            if completed.returncode != 0:
+                item["status"] = "failed"
+                report["errors"].append({"stage": "ingest", "file": str(part), "stderr": completed.stderr[-3000:]})
+                report["status"] = "partial"
+            else:
+                source_id = parsed.get("source_id")
+                item["status"] = parsed.get("status", "unknown")
+                if source_id:
+                    report["updated_files"].append(str(vault / "derived" / source_id / "content.json"))
+                if parsed.get("page"):
+                    report["generated_files"].append(parsed["page"])
+                    report["next_paths"].append(parsed["page"])
+                if source_id and item["status"] == "parsed_only" and args.digest_engine == "codex":
+                    try:
+                        maybe_prepare_digest_bundle(vault, source_id, report)
+                        item["bundle"] = str(vault / "logs" / "codex-digest-bundles" / f"{source_id}.json")
+                    except Exception as exc:
+                        report["errors"].append({"stage": "prepare-source", "source_id": source_id, "error": str(exc)})
+                        report["status"] = "partial"
         results.append(item)
     report["results"]["files"] = results
     finish(report, vault)
@@ -1302,6 +1911,11 @@ def command_ingest_folder(args: argparse.Namespace) -> None:
     vault = Path(args.vault).resolve()
     report = base_report("ingest-folder", vars(args))
     project = project_path(args.project)
+    if args.ocr_engine == "unlimited-ocr" and args.digest_engine != "codex":
+        report["status"] = "failed"
+        report["errors"].append({"stage": "ingest-folder", "error": "Unlimited-OCR currently supports only the codex digest workflow."})
+        finish(report, vault)
+        return
     cache = load_cache(vault)
     existing = set(cache.get("sources", {}).keys())
     files = sorted(path for path in Path(args.folder).glob("*") if path.is_file() and fnmatch.fnmatch(path.name, args.pattern))
@@ -1321,42 +1935,71 @@ def command_ingest_folder(args: argparse.Namespace) -> None:
             title = None
             if len(parts) > 1:
                 title = f"{path.stem} part {index:03d}"
-            cli_args = ["ingest", str(part), "--vault", str(vault)]
-            if title:
-                cli_args.extend(["--title", title])
-            for tag in args.tag:
-                cli_args.extend(["--tag", tag])
-            completed = run_cli(project, cli_args, env=ingest_env(effective_structure, args.mineru_timeout, args.digest_engine))
-            parsed = parse_key_value_stdout(completed.stdout)
-            item = {"file": str(path), "part_file": str(part), "returncode": completed.returncode, **parsed}
-            if completed.returncode != 0:
-                item["status"] = "failed"
-                report["errors"].append({"stage": "ingest", "file": str(part), "stderr": completed.stderr[-3000:]})
-                report["status"] = "partial"
-            else:
-                item_status = parsed.get("status", "unknown")
-                item["status"] = item_status
-                parsed_source_id = parsed.get("source_id")
-                if parsed_source_id:
-                    existing.add(parsed_source_id)
-                    report["updated_files"].append(str(vault / "derived" / parsed_source_id / "content.json"))
-                if parsed.get("page"):
-                    report["generated_files"].append(parsed["page"])
-                    report["next_paths"].append(parsed["page"])
-                if item_status == "parsed_only" and parsed_source_id and args.digest_engine == "codex":
-                    try:
-                        maybe_prepare_digest_bundle(vault, parsed_source_id, report)
-                        item["bundle"] = str(vault / "logs" / "codex-digest-bundles" / f"{parsed_source_id}.json")
-                    except Exception as exc:
-                        report["errors"].append({"stage": "prepare-source", "source_id": parsed_source_id, "error": str(exc)})
+            if args.ocr_engine == "unlimited-ocr":
+                try:
+                    ocr_project = unlimited_ocr_project_path(args.unlimited_ocr_project)
+                    ocr_output_dir = vault / "logs" / "skill-runs" / f"{report['run_id']}-unlimited-ocr" / path.stem / part.stem
+                    completed = run_unlimited_ocr(ocr_project, part, ocr_output_dir, args.unlimited_ocr_concurrency)
+                    item = {"file": str(path), "part_file": str(part), "returncode": completed.returncode}
+                    if completed.returncode != 0:
+                        item["status"] = "failed"
+                        report["errors"].append({"stage": "ocr", "file": str(part), "stderr": completed.stderr[-3000:], "stdout": completed.stdout[-2000:]})
                         report["status"] = "partial"
+                    else:
+                        source_id = sha1_file(part)
+                        parsed = write_unlimited_ocr_outputs(vault, part, source_id, title or part.stem, list(args.tag), ocr_output_dir, cache)
+                        item.update(parsed)
+                        existing.add(source_id)
+                        report["updated_files"].extend([parsed["content_json_path"], parsed["content_markdown_path"], str(vault / ".wiki-cache.json")])
+                        if parsed["status"] == "parsed_only" and args.digest_engine == "codex":
+                            try:
+                                maybe_prepare_digest_bundle(vault, source_id, report)
+                                item["bundle"] = str(vault / "logs" / "codex-digest-bundles" / f"{source_id}.json")
+                            except Exception as exc:
+                                report["errors"].append({"stage": "prepare-source", "source_id": source_id, "error": str(exc)})
+                                report["status"] = "partial"
+                except Exception as exc:
+                    item = {"file": str(path), "part_file": str(part), "status": "failed"}
+                    report["errors"].append({"stage": "ocr", "file": str(part), "error": str(exc)})
+                    report["status"] = "partial"
+            else:
+                cli_args = ["ingest", str(part), "--vault", str(vault)]
+                if title:
+                    cli_args.extend(["--title", title])
+                for tag in args.tag:
+                    cli_args.extend(["--tag", tag])
+                completed = run_cli(project, cli_args, env=ingest_env(effective_structure, args.mineru_timeout, args.digest_engine))
+                parsed = parse_key_value_stdout(completed.stdout)
+                item = {"file": str(path), "part_file": str(part), "returncode": completed.returncode, **parsed}
+                if completed.returncode != 0:
+                    item["status"] = "failed"
+                    report["errors"].append({"stage": "ingest", "file": str(part), "stderr": completed.stderr[-3000:]})
+                    report["status"] = "partial"
+                else:
+                    item_status = parsed.get("status", "unknown")
+                    item["status"] = item_status
+                    parsed_source_id = parsed.get("source_id")
+                    if parsed_source_id:
+                        existing.add(parsed_source_id)
+                        report["updated_files"].append(str(vault / "derived" / parsed_source_id / "content.json"))
+                    if parsed.get("page"):
+                        report["generated_files"].append(parsed["page"])
+                        report["next_paths"].append(parsed["page"])
+                    if item_status == "parsed_only" and parsed_source_id and args.digest_engine == "codex":
+                        try:
+                            maybe_prepare_digest_bundle(vault, parsed_source_id, report)
+                            item["bundle"] = str(vault / "logs" / "codex-digest-bundles" / f"{parsed_source_id}.json")
+                        except Exception as exc:
+                            report["errors"].append({"stage": "prepare-source", "source_id": parsed_source_id, "error": str(exc)})
+                            report["status"] = "partial"
             results.append(item)
     report["environment"] = {
         "project": str(project),
         "vault": str(vault),
-        "pdf_parser": "MinerU VLM",
+        "pdf_parser": "MinerU VLM" if args.ocr_engine == "mineru" else "Unlimited-OCR",
         "split_pages": args.split_pages,
         "digest_engine": args.digest_engine,
+        "ocr_engine": args.ocr_engine,
     }
     report["results"]["files"] = results
     finish(report, vault)
@@ -1721,6 +2364,287 @@ def command_query(args: argparse.Namespace) -> None:
     finish(report, vault)
 
 
+def command_sciverse_search(args: argparse.Namespace) -> None:
+    vault = Path(args.vault).resolve()
+    report = base_report("sciverse-search", vars(args))
+    try:
+        token = load_sciverse_token()
+        fields = merge_unique_lists(args.field or ["title", "doi", "publication_published_year", "publication_venue_name_unified"])
+        filters = parse_sciverse_filter_json(args.filter_json)
+        payload = {
+            "query": args.query,
+            "filters": filters,
+            "fields": fields,
+            "page": args.page,
+            "page_size": args.page_size,
+        }
+        raw = sciverse_post_meta_search(payload, token)
+        if clean_text(raw.get("code")) and clean_text(raw.get("code")) != "SUCCESS":
+            raise RuntimeError(f"Sciverse returned {clean_text(raw.get('code'))}: {clean_text(raw.get('message'))}")
+        normalized_results = [normalize_sciverse_result(item, idx) for idx, item in enumerate(raw.get("results", []), start=1)]
+        normalized = {
+            "query": args.query,
+            "page": raw.get("page", args.page),
+            "page_size": raw.get("page_size", args.page_size),
+            "total_count": raw.get("total_count", 0),
+            "total_pages": raw.get("total_pages", 0),
+            "search_time_ms": raw.get("search_time_ms"),
+            "next_cursor": clean_text(raw.get("next_cursor")),
+            "fields": fields,
+            "filters": filters,
+            "results": normalized_results,
+        }
+        base_name = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(args.query)[:60]}"
+        search_dir = sciverse_search_dir(vault)
+        results_path = Path(args.output).resolve() if args.output else search_dir / f"{base_name}.results.json"
+        raw_path = search_dir / f"{base_name}.raw.json"
+        dump_json(results_path, normalized)
+        report["generated_files"].append(str(results_path))
+        if args.save_raw:
+            dump_json(raw_path, raw)
+            report["generated_files"].append(str(raw_path))
+        report["results"] = {
+            "query": args.query,
+            "result_count": len(normalized_results),
+            "total_count": normalized["total_count"],
+            "page": normalized["page"],
+            "page_size": normalized["page_size"],
+            "results_path": str(results_path),
+            "raw_path": str(raw_path) if args.save_raw else "",
+            "items": normalized_results,
+        }
+        report["next_paths"].append(str(results_path))
+        if args.save_raw:
+            report["next_paths"].append(str(raw_path))
+    except Exception as exc:
+        report["status"] = "failed"
+        report["errors"].append({"stage": "sciverse-search", "error": str(exc)})
+    finish(report, vault)
+
+
+def command_sciverse_import(args: argparse.Namespace) -> None:
+    vault = Path(args.vault).resolve()
+    report = base_report("sciverse-import", vars(args))
+    cache = load_cache(vault)
+    try:
+        payload = load_json(Path(args.search_results).resolve(), {})
+        if not isinstance(payload, dict):
+            raise ValueError("search results file must contain a JSON object")
+        query = clean_text(payload.get("query"))
+        results = payload.get("results")
+        if not isinstance(results, list) or not results:
+            raise ValueError("search results file contains no results")
+        if args.all:
+            selected = results
+        else:
+            indexes = parse_indexes(args.indexes or "")
+            rank_map = {int(item.get("rank")): item for item in results if str(item.get("rank")).isdigit()}
+            missing = [index for index in indexes if index not in rank_map]
+            if missing:
+                raise ValueError(f"Selected ranks not found in results: {missing}")
+            selected = [rank_map[index] for index in indexes]
+
+        imported: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for item in selected:
+            existing = find_existing_sciverse_source(cache, item)
+            if existing is not None:
+                source_id, source = existing
+                skipped.append(
+                    {
+                        "rank": item.get("rank"),
+                        "reason": "duplicate",
+                        "source_id": source_id,
+                        "title": source.get("title") or source_id,
+                    }
+                )
+                continue
+            source_id, record, metadata, metadata_path = build_sciverse_source_record(
+                vault=vault,
+                result=item,
+                query=query,
+                tags=merge_unique_lists(["sciverse", "candidate"], args.tag),
+                purpose_role=clean_text(args.purpose_role),
+            )
+            dump_json(metadata_path, metadata)
+            cache["sources"][source_id] = record
+            imported.append(
+                {
+                    "rank": item.get("rank"),
+                    "source_id": source_id,
+                    "title": record["title"],
+                    "metadata_path": str(metadata_path),
+                }
+            )
+            report["generated_files"].append(str(metadata_path))
+
+        save_cache(vault, cache)
+        report["updated_files"].append(str(vault / ".wiki-cache.json"))
+        report["results"] = {
+            "query": query,
+            "selected_count": len(selected),
+            "imported_count": len(imported),
+            "skipped_count": len(skipped),
+            "imported": imported,
+            "skipped": skipped,
+        }
+        report["skipped"].extend(skipped)
+        if imported:
+            report["next_paths"].append(str(vault / ".wiki-cache.json"))
+        if skipped and not imported:
+            report["status"] = "partial"
+    except Exception as exc:
+        report["status"] = "failed"
+        report["errors"].append({"stage": "sciverse-import", "error": str(exc)})
+    finish(report, vault)
+
+
+def command_sciverse_fetch(args: argparse.Namespace) -> None:
+    vault = Path(args.vault).resolve()
+    report = base_report("sciverse-fetch", vars(args))
+    cache = load_cache(vault)
+    try:
+        selected_ids = source_ids_from_args(cache, args.source_id, args.all)
+        fetched: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for selected_id in selected_ids:
+            source = cache["sources"].get(selected_id)
+            if not isinstance(source, dict):
+                continue
+            if clean_text(source.get("discovery_source")) != "sciverse":
+                skipped.append({"source_id": selected_id, "reason": "not-sciverse-source"})
+                continue
+            metadata_path = sciverse_metadata_path(vault, selected_id)
+            metadata = load_json(metadata_path, {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            try:
+                access = fetch_sciverse_access_info(source)
+            except Exception as exc:
+                skipped.append({"source_id": selected_id, "reason": str(exc)})
+                continue
+            metadata["access"] = access
+            metadata.setdefault("raw_result", {})
+            dump_json(metadata_path, metadata)
+            source["doi_url"] = access["doi_url"]
+            source["resolved_url"] = access["resolved_url"]
+            if access["pdf_candidate_url"]:
+                source["pdf_candidate_url"] = access["pdf_candidate_url"]
+            source["source_discovery_metadata_path"] = vault_relative(metadata_path, vault)
+            cache["sources"][selected_id] = source
+            fetched.append(
+                {
+                    "source_id": selected_id,
+                    "title": source.get("title") or selected_id,
+                    "doi_url": access["doi_url"],
+                    "resolved_url": access["resolved_url"],
+                    "pdf_candidate_url": access["pdf_candidate_url"],
+                }
+            )
+            report["updated_files"].append(str(metadata_path))
+        save_cache(vault, cache)
+        report["updated_files"].append(str(vault / ".wiki-cache.json"))
+        report["results"] = {
+            "selected_count": len(selected_ids),
+            "fetched_count": len(fetched),
+            "skipped_count": len(skipped),
+            "fetched": fetched,
+            "skipped": skipped,
+        }
+        report["skipped"].extend(skipped)
+        if skipped and not fetched:
+            report["status"] = "partial"
+    except Exception as exc:
+        report["status"] = "failed"
+        report["errors"].append({"stage": "sciverse-fetch", "error": str(exc)})
+    finish(report, vault)
+
+
+def command_sciverse_download(args: argparse.Namespace) -> None:
+    vault = Path(args.vault).resolve()
+    report = base_report("sciverse-download", vars(args))
+    cache = load_cache(vault)
+    try:
+        selected_ids = source_ids_from_args(cache, args.source_id, args.all)
+        downloaded: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for selected_id in selected_ids:
+            source = cache["sources"].get(selected_id)
+            if not isinstance(source, dict):
+                continue
+            if clean_text(source.get("discovery_source")) != "sciverse":
+                skipped.append({"source_id": selected_id, "reason": "not-sciverse-source"})
+                continue
+            try:
+                pdf_path, download_info = download_sciverse_pdf(source, vault)
+            except Exception as exc:
+                skipped.append({"source_id": selected_id, "reason": str(exc)})
+                continue
+
+            metadata_path = sciverse_metadata_path(vault, selected_id)
+            metadata = load_json(metadata_path, {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["download"] = download_info
+            dump_json(metadata_path, metadata)
+            source["downloaded_pdf_path"] = vault_relative(pdf_path, vault)
+            cache["sources"][selected_id] = source
+            save_cache(vault, cache)
+            report["generated_files"].append(str(pdf_path))
+            report["updated_files"].extend([str(metadata_path), str(vault / ".wiki-cache.json")])
+
+            ingest_report: dict[str, Any] | None = None
+            ingested_source_id = ""
+            if args.ingest:
+                ingest_args = ["ingest-file", "--file", str(pdf_path), "--vault", str(vault), "--title", str(source.get("title") or selected_id)]
+                for tag in merge_unique_lists(source.get("tags"), ["sciverse", "downloaded"]):
+                    ingest_args.extend(["--tag", tag])
+                if clean_text(args.project):
+                    ingest_args.extend(["--project", args.project])
+                if args.mineru_timeout:
+                    ingest_args.extend(["--mineru-timeout", str(args.mineru_timeout)])
+                if args.split_pages:
+                    ingest_args.extend(["--split-pages", str(args.split_pages)])
+                if clean_text(getattr(args, "ocr_engine", "")):
+                    ingest_args.extend(["--ocr-engine", args.ocr_engine])
+                if clean_text(getattr(args, "unlimited_ocr_project", "")):
+                    ingest_args.extend(["--unlimited-ocr-project", args.unlimited_ocr_project])
+                if getattr(args, "unlimited_ocr_concurrency", None):
+                    ingest_args.extend(["--unlimited-ocr-concurrency", str(args.unlimited_ocr_concurrency)])
+                ingest_report = run_self_command(ingest_args)
+                files = list((ingest_report.get("results") or {}).get("files") or [])
+                if files:
+                    ingested_source_id = clean_text(files[0].get("source_id"))
+                if ingested_source_id:
+                    merge_sciverse_candidate_into_ingested_source(vault, selected_id, ingested_source_id, download_info)
+                    cache = load_cache(vault)
+            downloaded.append(
+                {
+                    "source_id": selected_id,
+                    "title": source.get("title") or selected_id,
+                    "pdf_path": str(pdf_path),
+                    "download_url": download_info["download_url"],
+                    "ingested_source_id": ingested_source_id,
+                    "ingest_report_run_id": clean_text((ingest_report or {}).get("run_id")),
+                }
+            )
+
+        report["results"] = {
+            "selected_count": len(selected_ids),
+            "downloaded_count": len(downloaded),
+            "skipped_count": len(skipped),
+            "downloaded": downloaded,
+            "skipped": skipped,
+        }
+        report["skipped"].extend(skipped)
+        if skipped and not downloaded:
+            report["status"] = "partial"
+    except Exception as exc:
+        report["status"] = "failed"
+        report["errors"].append({"stage": "sciverse-download", "error": str(exc)})
+    finish(report, vault)
+
+
 def audit_terms(values: list[str]) -> list[str]:
     low = {"and", "big", "china", "aggregate", "paper", "series", "working", "abstract", "introduction"}
     bad = []
@@ -1737,10 +2661,17 @@ def command_audit_vault(args: argparse.Namespace) -> None:
     cache = load_cache(vault)
 
     unstructured = []
+    discovered_only = []
     missing = []
     noisy = []
     for source_id, item in cache.get("sources", {}).items():
         if not isinstance(item, dict):
+            continue
+        if clean_text(item.get("status")) == "discovered_only":
+            discovered_only.append(source_id)
+            metadata_path = str(item.get("source_discovery_metadata_path") or "").strip()
+            if metadata_path and not (vault / metadata_path).exists():
+                missing.append({"source_id": source_id, "field": "source_discovery_metadata_path", "path": metadata_path})
             continue
         digest_path = str(item.get("digest_path") or "").strip()
         if not digest_path or not (vault / digest_path).exists():
@@ -1762,6 +2693,7 @@ def command_audit_vault(args: argparse.Namespace) -> None:
         "sources": len(cache.get("sources", {})),
         "topic_pages": len(cache.get("topic_pages", {})),
         "entity_pages": len(cache.get("entity_pages", {})),
+        "discovered_only_sources": discovered_only,
         "unstructured_sources": unstructured,
         "missing_files": missing,
         "noisy_terms": noisy,
@@ -1792,6 +2724,9 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--title")
     ingest.add_argument("--mineru-timeout", type=int)
     ingest.add_argument("--split-pages", type=int, default=50, help="Split PDFs into 50-page parts by default before sending each part to MinerU.")
+    ingest.add_argument("--ocr-engine", choices=["mineru", "unlimited-ocr"], default="mineru")
+    ingest.add_argument("--unlimited-ocr-project")
+    ingest.add_argument("--unlimited-ocr-concurrency", type=int)
     ingest.add_argument("--structure", action=argparse.BooleanOptionalAction, default=True)
     ingest.add_argument("--digest-engine", choices=["codex", "llm"], default="codex")
     ingest.set_defaults(func=command_ingest_file)
@@ -1805,6 +2740,9 @@ def build_parser() -> argparse.ArgumentParser:
     folder.add_argument("--tag", action="append", default=[])
     folder.add_argument("--mineru-timeout", type=int)
     folder.add_argument("--split-pages", type=int, default=50, help="Split each PDF into 50-page parts by default before sending each part to MinerU.")
+    folder.add_argument("--ocr-engine", choices=["mineru", "unlimited-ocr"], default="mineru")
+    folder.add_argument("--unlimited-ocr-project")
+    folder.add_argument("--unlimited-ocr-concurrency", type=int)
     folder.add_argument("--structure", action=argparse.BooleanOptionalAction, default=True)
     folder.add_argument("--skip-duplicates", action=argparse.BooleanOptionalAction, default=True)
     folder.add_argument("--digest-engine", choices=["codex", "llm"], default="codex")
@@ -1873,6 +2811,45 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--limit", type=int, default=5)
     query.add_argument("--project")
     query.set_defaults(func=command_query)
+
+    sciverse_search = sub.add_parser("sciverse-search")
+    sciverse_search.add_argument("--vault", required=True)
+    sciverse_search.add_argument("--query", required=True)
+    sciverse_search.add_argument("--page", type=int, default=1)
+    sciverse_search.add_argument("--page-size", type=int, default=10)
+    sciverse_search.add_argument("--field", action="append", default=[])
+    sciverse_search.add_argument("--filter-json", default="[]")
+    sciverse_search.add_argument("--output")
+    sciverse_search.add_argument("--save-raw", action=argparse.BooleanOptionalAction, default=True)
+    sciverse_search.set_defaults(func=command_sciverse_search)
+
+    sciverse_import = sub.add_parser("sciverse-import")
+    sciverse_import.add_argument("--vault", required=True)
+    sciverse_import.add_argument("--search-results", required=True)
+    sciverse_import.add_argument("--indexes")
+    sciverse_import.add_argument("--all", action=argparse.BooleanOptionalAction, default=False)
+    sciverse_import.add_argument("--tag", action="append", default=[])
+    sciverse_import.add_argument("--purpose-role", default="")
+    sciverse_import.set_defaults(func=command_sciverse_import)
+
+    sciverse_fetch = sub.add_parser("sciverse-fetch")
+    sciverse_fetch.add_argument("--vault", required=True)
+    sciverse_fetch.add_argument("--source-id", default="")
+    sciverse_fetch.add_argument("--all", action=argparse.BooleanOptionalAction, default=False)
+    sciverse_fetch.set_defaults(func=command_sciverse_fetch)
+
+    sciverse_download = sub.add_parser("sciverse-download")
+    sciverse_download.add_argument("--vault", required=True)
+    sciverse_download.add_argument("--source-id", default="")
+    sciverse_download.add_argument("--all", action=argparse.BooleanOptionalAction, default=False)
+    sciverse_download.add_argument("--ingest", action=argparse.BooleanOptionalAction, default=True)
+    sciverse_download.add_argument("--project", default="")
+    sciverse_download.add_argument("--mineru-timeout", type=int)
+    sciverse_download.add_argument("--split-pages", type=int, default=50)
+    sciverse_download.add_argument("--ocr-engine", choices=["mineru", "unlimited-ocr"], default="mineru")
+    sciverse_download.add_argument("--unlimited-ocr-project", default="")
+    sciverse_download.add_argument("--unlimited-ocr-concurrency", type=int)
+    sciverse_download.set_defaults(func=command_sciverse_download)
 
     audit = sub.add_parser("audit-vault")
     audit.add_argument("--vault", required=True)

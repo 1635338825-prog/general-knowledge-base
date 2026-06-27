@@ -57,6 +57,9 @@ Optional:
 - `--tag`
 - `--title`
 - `--mineru-timeout`
+- `--ocr-engine mineru|unlimited-ocr` with default `mineru`
+- `--unlimited-ocr-project` when `--ocr-engine unlimited-ocr`
+- `--unlimited-ocr-concurrency`
 - `--structure/--no-structure`
 - `--split-pages` with default `50`
 - `--digest-engine codex|llm` with default `codex`
@@ -64,7 +67,10 @@ Optional:
 Behavior:
 
 - PDF files are split into page chunks before parsing when `--split-pages > 0`
-- each chunk is still parsed by MinerU VLM
+- each chunk is parsed by the selected OCR backend
+- `mineru` remains the default parser
+- `unlimited-ocr` is an optional parser and currently supports only the `codex` digest workflow
+- `unlimited-ocr` output must be normalized into the same `derived/<source-id>/content.json` and `content.md` files used by MinerU
 - with `--digest-engine codex`, the script leaves the source in `parsed_only` and generates a Codex bundle plus prompt
 - with `--digest-engine llm`, the run uses the low-level automatic LLM digestion path
 
@@ -89,7 +95,7 @@ Behavior:
 - reads existing `derived/<source-id>/content.json` and `content.md`
 - writes `logs/codex-digest-bundles/<source-id>.json` unless overridden
 - writes `logs/codex-digest-bundles/<source-id>.prompt.md` unless overridden
-- does not rerun MinerU
+- does not rerun parsing
 
 ### `apply-digest`
 
@@ -258,7 +264,7 @@ Behavior:
 
 - with `codex`, this is a compatibility alias for preparing a source bundle and prompt
 - with `llm`, this runs the old automatic digestion path
-- must not rerun MinerU in either mode
+- must not rerun parsing in either mode
 
 ### `rebuild`
 
@@ -292,6 +298,95 @@ Optional:
 
 - `--project`
 - `--limit`
+
+### `sciverse-search`
+
+Required:
+
+- `--vault`
+- `--query`
+
+Optional:
+
+- `--page`
+- `--page-size`
+- `--field` repeatable
+- `--filter-json`
+- `--output`
+- `--save-raw/--no-save-raw`
+
+Behavior:
+
+- reads `SCIVERSE_API_TOKEN` from the environment
+- calls `https://api.sciverse.space/meta-search`
+- writes normalized results under `logs/sciverse-search/*.results.json`
+- optionally writes the raw API response under `logs/sciverse-search/*.raw.json`
+- does not create source pages or parsed content
+
+### `sciverse-import`
+
+Required:
+
+- `--vault`
+- `--search-results`
+
+Optional:
+
+- `--indexes`
+- `--all`
+- `--tag` repeatable
+- `--purpose-role`
+
+Behavior:
+
+- reads a prior `sciverse-search` `results.json`
+- imports selected hits into `.wiki-cache.json` as `discovered_only` sources
+- writes `derived/<source-id>/sciverse.json` for each imported source
+- does not download files
+- does not run MinerU or Unlimited-OCR
+- does not create `content.json`, `content.md`, `digest.json`, or source pages
+
+### `sciverse-fetch`
+
+Required:
+
+- `--vault`
+- one of `--source-id` or `--all`
+
+Behavior:
+
+- reads Sciverse-imported `discovered_only` sources from cache
+- resolves the DOI landing page when a DOI exists
+- updates `derived/<source-id>/sciverse.json` with access metadata
+- updates cache fields such as `doi_url`, `resolved_url`, and optionally `pdf_candidate_url`
+- does not download the PDF
+- does not create parsed content or digests
+
+### `sciverse-download`
+
+Required:
+
+- `--vault`
+- one of `--source-id` or `--all`
+
+Optional:
+
+- `--ingest/--no-ingest`
+- `--project`
+- `--mineru-timeout`
+- `--split-pages`
+- `--ocr-engine mineru|unlimited-ocr`
+- `--unlimited-ocr-project`
+- `--unlimited-ocr-concurrency`
+
+Behavior:
+
+- reads Sciverse-imported sources from cache
+- tries to download a real PDF using `pdf_candidate_url` or DOI-derived PDF heuristics
+- saves the PDF under `raw/sciverse/`
+- with default `--ingest`, immediately runs `ingest-file` on the downloaded PDF
+- if ingest succeeds, merges the old `discovered_only` candidate metadata into the ingested source record
+- if the remote URL is HTML or otherwise not a real PDF, the source is skipped instead of sending a bad file to ingest
 
 ### `audit-vault`
 
@@ -372,7 +467,7 @@ Required:
 
 ## Failure Rules
 
-- PDF failures must report MinerU errors and must not fall back to another parser.
+- Parse failures must report the selected backend error and must not silently fall back to another parser.
 - Missing `LLM_WIKI_MODEL` is not a parse failure. It is a valid `parsed_only` state.
 - A source with `content.json` but no `digest.json` is not digested.
 - `prepare-*` failure should preserve existing parsed outputs and existing digests.
