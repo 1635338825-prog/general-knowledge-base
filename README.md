@@ -5,7 +5,7 @@
 [![Release](https://img.shields.io/github/v/release/1635338825-prog/general-knowledge-base?label=release)](https://github.com/1635338825-prog/general-knowledge-base/releases)
 [![Last Commit](https://img.shields.io/github/last-commit/1635338825-prog/general-knowledge-base/master?label=last%20commit)](https://github.com/1635338825-prog/general-knowledge-base/commits/master)
 [![Repo Size](https://img.shields.io/github/repo-size/1635338825-prog/general-knowledge-base?label=repo%20size)](https://github.com/1635338825-prog/general-knowledge-base)
-[![License](https://img.shields.io/github/license/1635338825-prog/general-knowledge-base?label=license)](https://github.com/1635338825-prog/general-knowledge-base/blob/master/LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-green?label=license)](https://github.com/1635338825-prog/general-knowledge-base/blob/master/LICENSE)
 
 `general-knowledge-base` 是一个通用个人知识库 skill，用于把论文、PDF、Word、PPT、Markdown、项目文档和网页转存资料沉淀为可检索、可复用的知识资产。
 
