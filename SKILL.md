@@ -7,23 +7,25 @@ description: "Build and maintain an Obsidian-style personal knowledge base with 
 
 ## Overview
 
-Engine: `Codex`
-
 Use this skill when the goal is to operate the user's personal knowledge vault rather than summarize one file in isolation.
+
+This includes a thesis-oriented mode where the vault is expected to support actual paper writing, not just source digestion.
 
 The stable contract is:
 
-1. MinerU VLM parses source files into `derived/<source-id>/content.json` and `content.md` by default, or Unlimited-OCR does the same through the normalized adapter
+1. MinerU VLM parses source files into `derived/<source-id>/content.json` and `content.md`
 2. Codex or another LLM digests parsed content into `derived/<source-id>/digest.json`
 3. Scripts render digests into source / topic / entity pages
 4. qmd indexes the resulting pages for retrieval
 
-This skill also supports a Sciverse discovery loop:
+When thesis mode is enabled, the vault also maintains manual working pages under:
 
-1. `sciverse-search` queries Sciverse metadata search
-2. `sciverse-import` stores selected hits as `discovered_only` candidates
-3. `sciverse-fetch` resolves DOI landing pages and candidate PDF links
-4. `sciverse-download` downloads a real PDF and optionally sends it back through `ingest-file`
+- `wiki/core/`
+- `wiki/literature/`
+- `wiki/identification/`
+- `wiki/drafts/`
+
+These are writing work surfaces, not digest-rendered pages.
 
 Do not use heuristic scripts to understand the source. Script logic is only for orchestration, validation, rebuild, linking, and audit.
 
@@ -35,20 +37,22 @@ python .\scripts\wiki_task.py <command> ...
 
 ## Locked Rules
 
-- PDF parsing uses MinerU VLM by default. Unlimited-OCR can be used as an optional OCR backend when explicitly requested.
+- PDF parsing must use MinerU VLM.
 - Large PDFs split by page count only. Default is `--split-pages 50`.
 - `content.json` is the primary digestion input. `content.md` is supporting material.
 - The preferred workflow is Codex-driven digestion, not heuristic structuring.
 - `parsed_only` is a valid state.
-- `rebuild` must not rerun parsing.
+- `rebuild` must not rerun MinerU.
 - Source, topic, and entity understanding come from Codex or another LLM, not rule-based extraction.
 - `purpose` is a first-class digestion input. Read it before digesting.
+- All Markdown / JSON reads and writes must be explicit `UTF-8`.
+- On Windows, never assume PowerShell default decoding is correct for Markdown.
 
 ## Preferred Workflow
 
 ### Source
 
-1. `ingest-file` or `ingest-folder` parses with the configured OCR backend
+1. `ingest-file` or `ingest-folder` parses with MinerU VLM
 2. the script leaves the source in `parsed_only`
 3. the script generates:
    - `logs/codex-digest-bundles/<source-id>.json`
@@ -96,12 +100,6 @@ python .\scripts\wiki_task.py init-vault --vault D:\MyWiki --title "我的个人
 python .\scripts\wiki_task.py ingest-file --file "<file>" --vault D:\MyWiki --tag 资料
 ```
 
-Use Unlimited-OCR as the parsing backend:
-
-```powershell
-python .\scripts\wiki_task.py ingest-file --file "<file>" --vault D:\MyWiki --ocr-engine unlimited-ocr --unlimited-ocr-project "C:\path\Unlimited-OCR"
-```
-
 For large PDFs:
 
 ```powershell
@@ -119,8 +117,6 @@ python .\scripts\wiki_task.py ingest-file --file "<file>" --vault D:\MyWiki --di
 ```powershell
 python .\scripts\wiki_task.py ingest-folder --folder "<folder>" --vault D:\MyWiki --pattern "*.pdf" --tag 资料
 ```
-
-Unlimited-OCR is currently supported as a parsing backend for the codex digest workflow. It should produce normalized `content.json` and `content.md`, then continue through the same bundle/apply pipeline.
 
 ### 4. Prepare A Parsed Source For Codex
 
@@ -184,7 +180,22 @@ python .\scripts\wiki_task.py rebuild --vault D:\MyWiki
 
 Rebuild regenerates pages from existing digest files. It does not reparse files or auto-create new knowledge pages.
 
-### 12. Query And Audit
+### 12. Initialize Thesis Workspace
+
+```powershell
+python .\scripts\wiki_task.py init-thesis-workspace --vault D:\MyWiki
+```
+
+This creates starter pages for:
+
+- `wiki/core/`
+- `wiki/literature/`
+- `wiki/identification/`
+- `wiki/drafts/`
+
+Use `--force` only when you explicitly want to overwrite existing thesis-mode starter pages.
+
+### 13. Query And Audit
 
 ```powershell
 python .\scripts\wiki_task.py query --vault D:\MyWiki --question "<question>" --limit 5
@@ -194,22 +205,13 @@ python .\scripts\wiki_task.py query --vault D:\MyWiki --question "<question>" --
 python .\scripts\wiki_task.py audit-vault --vault D:\MyWiki
 ```
 
-### 13. Discover Papers With Sciverse
-
-```powershell
-$env:SCIVERSE_API_TOKEN = "<token>"
-python .\scripts\wiki_task.py sciverse-search --vault D:\MyWiki --query "graphene battery cycle stability" --page-size 5
-python .\scripts\wiki_task.py sciverse-import --vault D:\MyWiki --search-results "D:\MyWiki\logs\sciverse-search\<results>.results.json" --indexes 1,2 --purpose-role direct-evidence
-python .\scripts\wiki_task.py sciverse-fetch --vault D:\MyWiki --source-id <source-id>
-python .\scripts\wiki_task.py sciverse-download --vault D:\MyWiki --source-id <source-id>
-```
-
 ## References
 
 Read these files before changing the skill:
 
 - `references/io-contract.md`
 - `references/knowledge-schema.md`
+- `references/thesis-mode.md`
 - `references/retrieval-guidelines.md`
 - `references/purpose-taxonomy.md`
 - `references/command-cookbook.md`

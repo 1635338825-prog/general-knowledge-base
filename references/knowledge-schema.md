@@ -5,8 +5,29 @@ The stable contract is now:
 1. parser output
 2. digest
 3. rendered pages
+4. optional thesis working pages
 
 The script does not heuristically understand the source, topic, or entity. Codex or another LLM does.
+
+## Thesis Working Pages
+
+When the vault is used for paper writing, it may also include:
+
+- `wiki/core/`
+- `wiki/literature/`
+- `wiki/identification/`
+- `wiki/drafts/`
+
+These pages are not rendered from source digests.
+
+They are manual or Codex-authored working surfaces used to:
+
+- track the main argument
+- record literature gaps and bridge packages
+- store identification and robustness plans
+- draft chapter text
+
+They may link to source, topic, and entity pages, but they should not be confused with those page contracts.
 
 ## Parser Outputs
 
@@ -154,6 +175,17 @@ Visible headings:
 - `细节`
 - `结果与贡献`
 - `相关来源`
+
+### Thesis Working Pages
+
+There is no single mandatory schema for thesis working pages, but each page should stay purpose-specific and avoid duplicating raw source digests.
+
+Recommended starter sets:
+
+- `wiki/core/`: main-gap review, chapter map, strongest evidence pack, next literature batch
+- `wiki/literature/`: bridge literature list, candidate pool, role-based grouping
+- `wiki/identification/`: strategy card, threat card, robustness card, heterogeneity card
+- `wiki/drafts/`: abstract, literature review, research design, results, mechanism, conclusion
 
 ## Linking Rules
 
