@@ -83,6 +83,18 @@ wiki/drafts/
 
 这不是简单加目录，而是把论文主线、桥接文献、识别威胁、稳健性计划和章节草稿显式纳入知识库。
 
+## General Mode vs Thesis Mode
+
+| Mode | Purpose | Core Structure | When to use |
+| --- | --- | --- | --- |
+| `General Mode` | 沉淀通用知识、项目资料和长期学习材料 | `wiki/sources/` `wiki/topics/` `wiki/entities/` | 你只是想做一个长期可检索的资料知识库 |
+| `Thesis Mode` | 在知识沉淀之外继续推进论文写作 | General Mode + `wiki/core/` `wiki/literature/` `wiki/identification/` `wiki/drafts/` | 你需要显式管理主线、文献桥接、识别设计和章节草稿 |
+
+最重要的一点是：
+
+- `init-vault` = 创建通用知识库
+- `init-vault + init-thesis-workspace` = 创建论文知识库
+
 ## Quick Start
 
 ### 1. Create a General Knowledge Vault
