@@ -18,6 +18,8 @@ The stable contract is:
 3. Scripts render digests into source / topic / entity pages
 4. qmd indexes the resulting pages for retrieval
 
+For web pages, `web-ingest` and `firecrawl-ingest` use Firecrawl to produce the same `content.json` and `content.md` contract before entering the digest flow.
+
 When thesis mode is enabled, the vault also maintains manual working pages under:
 
 - `wiki/core/`
@@ -118,43 +120,57 @@ python .\scripts\wiki_task.py ingest-file --file "<file>" --vault D:\MyWiki --di
 python .\scripts\wiki_task.py ingest-folder --folder "<folder>" --vault D:\MyWiki --pattern "*.pdf" --tag 资料
 ```
 
-### 4. Prepare A Parsed Source For Codex
+### 4. Ingest A Web Page
+
+```powershell
+python .\scripts\wiki_task.py web-ingest --url "https://firecrawl.dev" --vault D:\MyWiki --tag 网页
+```
+
+Equivalent alias:
+
+```powershell
+python .\scripts\wiki_task.py firecrawl-ingest --url "https://firecrawl.dev" --vault D:\MyWiki --tag 网页
+```
+
+This path uses Firecrawl to fetch the page, then normalizes output into `derived/<source-id>/content.json` and `content.md`, and finally prepares a Codex bundle by default.
+
+### 5. Prepare A Parsed Source For Codex
 
 ```powershell
 python .\scripts\wiki_task.py prepare-source --vault D:\MyWiki --source-id <source-id>
 ```
 
-### 5. Apply A Codex Source Digest
+### 6. Apply A Codex Source Digest
 
 ```powershell
 python .\scripts\wiki_task.py apply-digest --vault D:\MyWiki --source-id <source-id> --digest-file "<digest.json>"
 ```
 
-### 6. Audit Parsed Sources That Still Need Digestion
+### 7. Audit Parsed Sources That Still Need Digestion
 
 ```powershell
 python .\scripts\wiki_task.py audit-readiness --vault D:\MyWiki
 ```
 
-### 7. Prepare A Topic For Codex
+### 8. Prepare A Topic For Codex
 
 ```powershell
 python .\scripts\wiki_task.py prepare-topic --vault D:\MyWiki --topic "个人知识管理"
 ```
 
-### 8. Apply A Codex Topic Digest
+### 9. Apply A Codex Topic Digest
 
 ```powershell
 python .\scripts\wiki_task.py apply-topic --vault D:\MyWiki --topic "个人知识管理" --digest-file "<topic-digest.json>"
 ```
 
-### 9. Prepare An Entity For Codex
+### 10. Prepare An Entity For Codex
 
 ```powershell
 python .\scripts\wiki_task.py prepare-entity --vault D:\MyWiki --entity "Obsidian vault"
 ```
 
-### 10. Apply A Codex Entity Digest
+### 11. Apply A Codex Entity Digest
 
 ```powershell
 python .\scripts\wiki_task.py apply-entity --vault D:\MyWiki --entity "Obsidian vault" --digest-file "<entity-digest.json>"
@@ -172,7 +188,7 @@ Use `structure-source` with the old automatic LLM path:
 python .\scripts\wiki_task.py structure-source --vault D:\MyWiki --source-id <source-id> --digest-engine llm
 ```
 
-### 11. Rebuild
+### 12. Rebuild
 
 ```powershell
 python .\scripts\wiki_task.py rebuild --vault D:\MyWiki
@@ -180,7 +196,7 @@ python .\scripts\wiki_task.py rebuild --vault D:\MyWiki
 
 Rebuild regenerates pages from existing digest files. It does not reparse files or auto-create new knowledge pages.
 
-### 12. Initialize Thesis Workspace
+### 13. Initialize Thesis Workspace
 
 ```powershell
 python .\scripts\wiki_task.py init-thesis-workspace --vault D:\MyWiki
@@ -195,7 +211,7 @@ This creates starter pages for:
 
 Use `--force` only when you explicitly want to overwrite existing thesis-mode starter pages.
 
-### 13. Query And Audit
+### 14. Query And Audit
 
 ```powershell
 python .\scripts\wiki_task.py query --vault D:\MyWiki --question "<question>" --limit 5

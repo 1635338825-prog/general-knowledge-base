@@ -34,6 +34,18 @@ Ingest a folder with Unlimited-OCR:
 python .\scripts\wiki_task.py ingest-folder --folder "C:\path\docs" --vault D:\MyWiki --pattern "*.pdf" --tag 资料 --ocr-engine unlimited-ocr --unlimited-ocr-project "C:\path\Unlimited-OCR"
 ```
 
+Ingest a web page with Firecrawl:
+
+```powershell
+python .\scripts\wiki_task.py web-ingest --url "https://firecrawl.dev" --vault D:\MyWiki --tag 网页
+```
+
+Equivalent explicit Firecrawl command:
+
+```powershell
+python .\scripts\wiki_task.py firecrawl-ingest --url "https://firecrawl.dev" --vault D:\MyWiki --tag 网页
+```
+
 Prepare a parsed source for Codex digestion:
 
 ```powershell

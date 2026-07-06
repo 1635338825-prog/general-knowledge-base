@@ -78,6 +78,33 @@ Behavior:
 
 Same contract as `ingest-file`, but batch-oriented.
 
+### `web-ingest`
+
+Required:
+
+- `--url`
+- `--vault`
+
+Optional:
+
+- `--tag`
+- `--title`
+- `--force/--no-force`
+- `--digest-engine codex|llm` with default `codex`
+
+Behavior:
+
+- uses Firecrawl to scrape a live web page into Markdown
+- writes normalized `derived/<source-id>/content.json` and `content.md`
+- stores the original URL under `raw/<source-id>/source-url.txt`
+- updates `.wiki-cache.json`
+- with `--digest-engine codex`, generates a Codex bundle plus prompt by default
+- with `--force`, refreshes an already known web source
+
+### `firecrawl-ingest`
+
+Same contract and behavior as `web-ingest`. This is an explicit alias for the Firecrawl-backed web ingestion path.
+
 ### `prepare-source`
 
 Required:

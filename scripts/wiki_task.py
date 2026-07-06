@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -1394,6 +1395,114 @@ def maybe_prepare_digest_bundle(vault: Path, source_id: str, report: dict[str, A
     report["next_paths"].extend([str(bundle_path), str(prompt_path)])
 
 
+def firecrawl_source_id(url: str) -> str:
+    normalized = clean_text(url)
+    return f"web_{hashlib.sha1(normalized.encode('utf-8')).hexdigest()[:12]}"
+
+
+def guess_title_from_markdown(markdown: str, fallback: str) -> str:
+    for line in markdown.splitlines():
+        stripped = clean_text(line)
+        if not stripped:
+            continue
+        if stripped.startswith("# "):
+            return clean_text(stripped[2:]) or fallback
+        return stripped[:160] or fallback
+    return fallback
+
+
+def resolve_firecrawl_executable() -> str:
+    for candidate in ["firecrawl", "firecrawl.cmd"]:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    roaming = Path(os.getenv("APPDATA", "")) / "npm"
+    for candidate in [roaming / "firecrawl.cmd", roaming / "firecrawl"]:
+        if candidate.exists():
+            return str(candidate)
+    raise FileNotFoundError("Firecrawl CLI not found in PATH. Install it first with `npx -y firecrawl-cli@latest init --all`.")
+
+
+def run_firecrawl_scrape(url: str, output_path: Path) -> subprocess.CompletedProcess[str]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [resolve_firecrawl_executable(), "scrape", url, "-o", str(output_path)]
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+
+
+def write_firecrawl_outputs(
+    vault: Path,
+    source_id: str,
+    url: str,
+    title: str,
+    tags: list[str],
+    scraped_markdown_path: Path,
+    cache: dict[str, Any],
+) -> dict[str, Any]:
+    markdown = read_text(scraped_markdown_path)
+    derived_dir = vault / "derived" / source_id
+    derived_dir.mkdir(parents=True, exist_ok=True)
+    content_md = derived_dir / "content.md"
+    content_json = derived_dir / "content.json"
+    raw_dir = vault / "raw" / source_id
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    source_url_path = raw_dir / "source-url.txt"
+
+    write_text(content_md, markdown if markdown.endswith("\n") else markdown + "\n")
+    write_text(source_url_path, url + "\n")
+    dump_json(
+        content_json,
+        {
+            "engine": "firecrawl",
+            "source_type": "web",
+            "url": url,
+            "title": title,
+            "retrieved_at": utc_now(),
+            "markdown_path": str(content_md),
+            "content_markdown": markdown,
+        },
+    )
+
+    source = ensure_source_record(vault, source_id, cache)
+    source.update(
+        {
+            "source_id": source_id,
+            "title": title,
+            "status": "parsed_only",
+            "parse_status": "parsed_only",
+            "structured_status": "pending",
+            "source_type": "web",
+            "original_path": url,
+            "raw_path": vault_relative(source_url_path, vault),
+            "derived_markdown_path": vault_relative(content_md, vault),
+            "derived_json_path": vault_relative(content_json, vault),
+            "tags": merge_unique_lists(tags, ["web", "firecrawl"]),
+            "ingested_at": utc_now(),
+            "retrieval_engine": "firecrawl",
+            "source_url": url,
+        }
+    )
+    cache["sources"][source_id] = source
+    save_cache(vault, cache)
+    return {
+        "source_id": source_id,
+        "status": "parsed_only",
+        "mode": "firecrawl",
+        "content_markdown_path": str(content_md),
+        "content_json_path": str(content_json),
+        "raw_path": str(source_url_path),
+    }
+
+
 def command_init_vault(args: argparse.Namespace) -> None:
     vault = Path(args.vault).resolve()
     report = base_report("init-vault", vars(args))
@@ -1546,6 +1655,62 @@ def command_ingest_folder(args: argparse.Namespace) -> None:
         "digest_engine": args.digest_engine,
     }
     report["results"]["files"] = results
+    finish(report, vault)
+
+
+def command_firecrawl_ingest(args: argparse.Namespace) -> None:
+    vault = Path(args.vault).resolve()
+    report = base_report("firecrawl-ingest", vars(args))
+    cache = load_cache(vault)
+    url = clean_text(args.url)
+    source_id = firecrawl_source_id(url)
+    report["environment"] = {
+        "vault": str(vault),
+        "retrieval_engine": "firecrawl",
+        "digest_engine": args.digest_engine,
+        "source_url": url,
+    }
+
+    existing = cache.get("sources", {}).get(source_id)
+    if isinstance(existing, dict) and not args.force:
+        report["status"] = "partial"
+        report["results"] = {
+            "source_id": source_id,
+            "status": "skipped_duplicate",
+            "reason": "existing web source; pass --force to refresh",
+        }
+        report["skipped"].append({"source_id": source_id, "url": url, "reason": "duplicate"})
+        finish(report, vault)
+        return
+
+    scrape_dir = vault / "logs" / "skill-runs" / f"{report['run_id']}-firecrawl"
+    scrape_output = scrape_dir / "scrape.md"
+    completed = run_firecrawl_scrape(url, scrape_output)
+    if completed.returncode != 0:
+        report["status"] = "failed"
+        report["errors"].append({"stage": "firecrawl-scrape", "stderr": completed.stderr[-3000:], "stdout": completed.stdout[-3000:]})
+        finish(report, vault)
+        return
+
+    try:
+        markdown = read_text(scrape_output)
+        fallback_title = url
+        title = clean_text(args.title) or guess_title_from_markdown(markdown, fallback_title)
+        parsed = write_firecrawl_outputs(vault, source_id, url, title, list(args.tag), scrape_output, cache)
+        report["generated_files"].append(str(scrape_output))
+        report["updated_files"].extend([parsed["content_json_path"], parsed["content_markdown_path"], str(vault / ".wiki-cache.json")])
+        result_item = {"url": url, "title": title, **parsed}
+        if parsed["status"] == "parsed_only" and args.digest_engine == "codex":
+            try:
+                maybe_prepare_digest_bundle(vault, source_id, report)
+                result_item["bundle"] = str(vault / "logs" / "codex-digest-bundles" / f"{source_id}.json")
+            except Exception as exc:
+                report["errors"].append({"stage": "prepare-source", "source_id": source_id, "error": str(exc)})
+                report["status"] = "partial"
+        report["results"] = result_item
+    except Exception as exc:
+        report["status"] = "failed"
+        report["errors"].append({"stage": "firecrawl-ingest", "error": str(exc)})
     finish(report, vault)
 
 
@@ -2001,6 +2166,24 @@ def build_parser() -> argparse.ArgumentParser:
     folder.add_argument("--skip-duplicates", action=argparse.BooleanOptionalAction, default=True)
     folder.add_argument("--digest-engine", choices=["codex", "llm"], default="codex")
     folder.set_defaults(func=command_ingest_folder)
+
+    firecrawl_ingest = sub.add_parser("firecrawl-ingest")
+    firecrawl_ingest.add_argument("--url", required=True)
+    firecrawl_ingest.add_argument("--vault", required=True)
+    firecrawl_ingest.add_argument("--tag", action="append", default=[])
+    firecrawl_ingest.add_argument("--title")
+    firecrawl_ingest.add_argument("--force", action=argparse.BooleanOptionalAction, default=False)
+    firecrawl_ingest.add_argument("--digest-engine", choices=["codex", "llm"], default="codex")
+    firecrawl_ingest.set_defaults(func=command_firecrawl_ingest)
+
+    web_ingest = sub.add_parser("web-ingest")
+    web_ingest.add_argument("--url", required=True)
+    web_ingest.add_argument("--vault", required=True)
+    web_ingest.add_argument("--tag", action="append", default=[])
+    web_ingest.add_argument("--title")
+    web_ingest.add_argument("--force", action=argparse.BooleanOptionalAction, default=False)
+    web_ingest.add_argument("--digest-engine", choices=["codex", "llm"], default="codex")
+    web_ingest.set_defaults(func=command_firecrawl_ingest)
 
     structure = sub.add_parser("structure-source")
     structure.add_argument("--vault", required=True)
